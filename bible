@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""bible — local, offline, fuzzy-findable Bible reader.
+
+    bible john 3:16               read (WEB by default)
+    bible kjv john 3:16           read another translation
+    bible ps 23                   whole chapter
+    bible matt 5:3-12             verse range
+    bible search "still small"    full-text search (FTS5, ranked)
+    bible find                    fuzzy pick a verse with fzf
+    bible random
+    bible --json john 3:16        machine output (for agents/editors)
+
+Data: ~/.local/share/bible/bible.db (built by build.py in ~/Projects/bible-cli)
+"""
+
+import json
+import os
+import random
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+DB = Path(os.environ.get("BIBLE_DB", Path.home() / ".local/share/bible/bible.db"))
+DEFAULT_TRANSLATION = os.environ.get("BIBLE_TRANSLATION", "web")
+TRANSLATIONS = {"web": "WEB", "kjv": "KJV"}
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def dim(t):     return c("38;2;150;140;130", t)
+def gold(t):    return c("38;2;232;184;75", t)
+def ref_color(t): return c("38;2;62;207;178", t)
+def red(t):     return c("38;2;200;16;46", t)
+
+
+BOOKS = [
+    ("Gen", "Genesis"), ("Exod", "Exodus"), ("Lev", "Leviticus"), ("Num", "Numbers"),
+    ("Deut", "Deuteronomy"), ("Josh", "Joshua"), ("Judg", "Judges"), ("Ruth", "Ruth"),
+    ("1Sam", "1 Samuel"), ("2Sam", "2 Samuel"), ("1Kgs", "1 Kings"), ("2Kgs", "2 Kings"),
+    ("1Chr", "1 Chronicles"), ("2Chr", "2 Chronicles"), ("Ezra", "Ezra"), ("Neh", "Nehemiah"),
+    ("Esth", "Esther"), ("Job", "Job"), ("Ps", "Psalms"), ("Prov", "Proverbs"),
+    ("Eccl", "Ecclesiastes"), ("Song", "Song of Solomon"), ("Isa", "Isaiah"), ("Jer", "Jeremiah"),
+    ("Lam", "Lamentations"), ("Ezek", "Ezekiel"), ("Dan", "Daniel"), ("Hos", "Hosea"),
+    ("Joel", "Joel"), ("Amos", "Amos"), ("Obad", "Obadiah"), ("Jonah", "Jonah"),
+    ("Mic", "Micah"), ("Nah", "Nahum"), ("Hab", "Habakkuk"), ("Zeph", "Zephaniah"),
+    ("Hag", "Haggai"), ("Zech", "Zechariah"), ("Mal", "Malachi"),
+    ("Matt", "Matthew"), ("Mark", "Mark"), ("Luke", "Luke"), ("John", "John"),
+    ("Acts", "Acts"), ("Rom", "Romans"), ("1Cor", "1 Corinthians"), ("2Cor", "2 Corinthians"),
+    ("Gal", "Galatians"), ("Eph", "Ephesians"), ("Phil", "Philippians"), ("Col", "Colossians"),
+    ("1Thess", "1 Thessalonians"), ("2Thess", "2 Thessalonians"), ("1Tim", "1 Timothy"),
+    ("2Tim", "2 Timothy"), ("Titus", "Titus"), ("Phlm", "Philemon"), ("Heb", "Hebrews"),
+    ("Jas", "James"), ("1Pet", "1 Peter"), ("2Pet", "2 Peter"), ("1John", "1 John"),
+    ("2John", "2 John"), ("3John", "3 John"), ("Jude", "Jude"), ("Rev", "Revelation"),
+]
+NAMES = {code: name for code, name in BOOKS}
+ALIASES = {
+    "psalm": "Ps", "psalms": "Ps", "psa": "Ps", "song": "Song", "songofsolomon": "Song",
+    "revelation": "Rev", "rev": "Rev", "phil": "Phil", "philippians": "Phil",
+    "jn": "John", "jhn": "John", "mk": "Mark", "lk": "Luke", "mt": "Matt", "mat": "Matt",
+    "deut": "Deut", "dt": "Deut", "ezek": "Ezek", "eze": "Ezek", "isa": "Isa",
+    "jer": "Jer", "hab": "Hab", "zeph": "Zeph", "zech": "Zech", "eccl": "Eccl",
+    "prov": "Prov", "pr": "Prov", "jas": "Jas", "phlm": "Phlm", "phm": "Phlm",
+    "gal": "Gal", "eph": "Eph", "col": "Col", "rom": "Rom", "cor": "Cor",
+    "1jn": "1John", "2jn": "2John", "3jn": "3John", "1jo": "1John", "2jo": "2John",
+    "3jo": "3John", "1th": "1Thess", "2th": "2Thess", "1ti": "1Tim", "2ti": "2Tim",
+    "1pe": "1Pet", "2pe": "2Pet", "1ki": "1Kgs", "2ki": "2Kgs", "1ch": "1Chr",
+    "2ch": "2Chr", "1sa": "1Sam", "2sa": "2Sam", "1co": "1Cor", "2co": "2Cor",
+}
+
+# lookup: normalised token -> code
+LOOKUP = {}
+for code, name in BOOKS:
+    for key in (code, name):
+        LOOKUP[key.lower().replace(" ", "")] = code
+LOOKUP.update(ALIASES)
+# "1jn", "1cor", "2thess"... — numeral plus the code without its numeral
+for _code, _name in BOOKS:
+    if _code[0] in "123":
+        LOOKUP[_code[0] + _code[1:].lower()] = _code
+
+
+def resolve_book(token: str):
+    key = token.lower().replace(".", "").replace(" ", "")
+    if key in LOOKUP:
+        return LOOKUP[key]
+    # "1corinthians" / "1co" / "icorinthians"
+    m = re.match(r"^(iii|ii|i|3|2|1)(.*)$", key)
+    if m:
+        numeral = {"i": "1", "ii": "2", "iii": "3"}.get(m.group(1), m.group(1))
+        rest = m.group(2)
+        for candidate in (numeral + rest, numeral + " " + rest):
+            if candidate in LOOKUP:
+                return LOOKUP[candidate]
+        # first three letters of the name
+        for code, name in BOOKS:
+            if name.startswith(numeral) and name.split()[-1].lower().startswith(rest[:3]):
+                return code
+    for code, name in BOOKS:
+        if name.lower().startswith(key) and len(key) >= 3:
+            return code
+    return None
+
+
+REF = re.compile(r"^(?P<book>[1-3]?\s?[a-zA-Z]+\.?)\s*(?P<rest>.*)$")
+
+
+def parse_ref(text: str):
+    raw = text.strip()
+    m = re.match(r"^(?P<book>[1-3]?\s?[A-Za-z]+\.?)\s*(?P<rest>.*)$", raw)
+    if not m:
+        return None
+    book = resolve_book(m.group("book"))
+    if not book:
+        return None
+    rest = m.group("rest").strip()
+    chapter = verse = verse_end = None
+    if rest:
+        vm = re.match(r"(\d+)(?::(\d+)(?:-(\d+))?)?$", rest)
+        if not vm:
+            return None
+        chapter = int(vm.group(1))
+        if vm.group(2):
+            verse = int(vm.group(2))
+        if vm.group(3):
+            verse_end = int(vm.group(3))
+        elif verse is not None:
+            verse_end = verse
+    return {"book": book, "chapter": chapter, "verse": verse, "verse_end": verse_end}
+
+
+def db():
+    if not DB.is_file():
+        sys.exit(f"no database at {DB} — run build.py first")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def label(book, chapter, verse=None, verse_end=None, translation=None):
+    name = NAMES.get(book, book)
+    out = f"{name} {chapter}" if chapter else name
+    if verse:
+        out += f":{verse}"
+        if verse_end:
+            out += f"-{verse_end}"
+    return out
+
+
+def get_verses(con, ref, translation):
+    sql = "SELECT code, chapter, verse, text FROM verses WHERE translation=? AND code=?"
+    args = [translation, ref["book"]]
+    if ref["chapter"] is not None:
+        sql += " AND chapter=?"
+        args.append(ref["chapter"])
+    if ref["verse"] is not None:
+        sql += " AND verse>=?"
+        args.append(ref["verse"])
+    if ref["verse_end"] is not None:
+        sql += " AND verse<=?"
+        args.append(ref["verse_end"])
+    sql += " ORDER BY chapter, verse"
+    return con.execute(sql, args).fetchall()
+
+
+def print_verses(rows, translation, header=True):
+    if not rows:
+        print(red("  nothing found"))
+        return
+    if header:
+        first, last = rows[0], rows[-1]
+        span = label(first["code"], first["chapter"], first["verse"],
+                     last["verse"] if last["verse"] != first["verse"] else None)
+        print()
+        print(f"  {ref_color(span)}  {dim(TRANSLATIONS.get(translation, translation))}")
+        print()
+    last_chapter = None
+    for row in rows:
+        if row["chapter"] != last_chapter:
+            if last_chapter is not None:
+                print()
+            last_chapter = row["chapter"]
+        print(f"  {dim(str(row['verse']).rjust(3))}  {row['text']}")
+    print()
+
+
+def search(con, query, translation, limit=20):
+    rows = con.execute(
+        """
+        SELECT v.code, v.chapter, v.verse, v.text, bm25(verses_fts) AS rank
+        FROM verses_fts JOIN verses v ON v.id = verses_fts.rowid
+        WHERE verses_fts MATCH ? AND v.translation = ?
+        ORDER BY rank LIMIT ?
+        """,
+        (fts_query(query), translation, limit),
+    ).fetchall()
+    return rows
+
+
+def fts_query(text):
+    # quote each token so punctuation in the query can't break the FTS syntax
+    tokens = re.findall(r"[A-Za-z0-9']+", text)
+    if not tokens:
+        return '""'
+    return " ".join(f'"{t}"' for t in tokens)
+
+
+def cmd_read(con, args, translation, as_json):
+    ref = parse_ref(" ".join(args))
+    if not ref:
+        print(red(f"  can't parse: {' '.join(args)}"))
+        print(dim("  try: bible john 3:16   ·   bible search grace"))
+        return 1
+    rows = get_verses(con, ref, translation)
+    if as_json:
+        print(json.dumps({
+            "translation": translation,
+            "reference": label(ref["book"], ref["chapter"], ref["verse"], ref["verse_end"]),
+            "verses": [
+                {"book": NAMES.get(r["code"], r["code"]), "chapter": r["chapter"],
+                 "verse": r["verse"], "text": r["text"]} for r in rows
+            ],
+        }, indent=2, ensure_ascii=False))
+        return 0 if rows else 1
+    print_verses(rows, translation)
+    return 0 if rows else 1
+
+
+def cmd_search(con, args, translation, as_json):
+    query = " ".join(args).strip()
+    if not query:
+        print(red("  search what?"))
+        return 1
+    rows = search(con, query, translation)
+    if as_json:
+        print(json.dumps({
+            "translation": translation, "query": query,
+            "results": [
+                {"reference": label(r["code"], r["chapter"], r["verse"]), "text": r["text"]}
+                for r in rows
+            ],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    print()
+    if not rows:
+        print(dim(f"  no matches for “{query}”"))
+    for row in rows:
+        print(f"  {ref_color(label(row['code'], row['chapter'], row['verse'])):24s}  {row['text']}")
+    print()
+    return 0
+
+
+def cmd_random(con, translation, as_json):
+    total = con.execute(
+        "SELECT count(*) FROM verses WHERE translation=?", (translation,)
+    ).fetchone()[0]
+    row = con.execute(
+        "SELECT code, chapter, verse, text FROM verses WHERE translation=? LIMIT 1 OFFSET ?",
+        (translation, random.randrange(total)),
+    ).fetchone()
+    if as_json:
+        print(json.dumps({"translation": translation,
+                          "reference": label(row["code"], row["chapter"], row["verse"]),
+                          "text": row["text"]}, indent=2, ensure_ascii=False))
+        return 0
+    print()
+    print(f"  {ref_color(label(row['code'], row['chapter'], row['verse']))}")
+    print(f"  {row['text']}")
+    print()
+    return 0
+
+
+def cmd_find(con, translation):
+    if not shutil.which("fzf"):
+        sys.exit("fzf not installed")
+    lines = [
+        f"{label(row['code'], row['chapter'], row['verse'])}\t{row['text']}"
+        for row in con.execute(
+            """
+            SELECT v.code, v.chapter, v.verse, v.text
+            FROM verses v JOIN books b
+              ON b.translation = v.translation AND b.code = v.code
+            WHERE v.translation = ?
+            ORDER BY b.ord, v.chapter, v.verse
+            """,
+            (translation,),
+        )
+    ]
+    proc = subprocess.run(
+        ["fzf", "--delimiter=\t", "--with-nth=1,2", "--prompt=bible> ",
+         "--preview", "echo {} | cut -f2- | fold -s -w 80"],
+        input="\n".join(lines), text=True, capture_output=True,
+    )
+    if proc.returncode == 0 and proc.stdout.strip():
+        print(proc.stdout.split("\t", 1)[0])
+    return 0
+
+
+def usage():
+    print()
+    print(f"  {gold('bible')} — local Bible (WEB + KJV, offline)")
+    print()
+    print(f"  {ref_color('bible john 3:16')}          one verse        {dim('(add --json for machines)')}")
+    print(f"  {ref_color('bible ps 23')}               whole chapter")
+    print(f"  {ref_color('bible matt 5:3-12')}         verse range")
+    print(f"  {ref_color('bible kjv john 3:16')}       another translation")
+    print(f"  {ref_color('bible search still small')}  ranked full-text search")
+    print(f"  {ref_color('bible find')}                fuzzy pick with fzf")
+    print(f"  {ref_color('bible random')}")
+    print()
+    print(dim(f"  {DB}"))
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = False
+    if "--json" in args:
+        args.remove("--json")
+        as_json = True
+    if not args or args[0] in ("help", "-h", "--help"):
+        usage()
+        return 0
+    translation = DEFAULT_TRANSLATION
+    if args and args[0].lower() in TRANSLATIONS:
+        translation = args.pop(0).lower()
+    if not args:
+        usage()
+        return 0
+    con = db()
+    cmd = args[0].lower()
+    if cmd == "search":
+        return cmd_search(con, args[1:], translation, as_json)
+    if cmd == "random":
+        return cmd_random(con, translation, as_json)
+    if cmd == "find":
+        return cmd_find(con, translation)
+    return cmd_read(con, args, translation, as_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
