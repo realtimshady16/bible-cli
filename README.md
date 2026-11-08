@@ -47,6 +47,21 @@ The CLI is the integration: `bible --json` returns
 `{translation, reference, verses:[{book,chapter,verse,text}]}`. A pi skill lives
 at `~/.pi/agent/skills/bible/SKILL.md`.
 
+## Licence and data
+
+The code is MIT (see `LICENSE`). **This repository distributes no scripture
+text.** `data/` is ignored; `build.py` downloads the sources and turns them into
+a local database. Both are public domain:
+
+- **KJV** (1769) — public domain in most jurisdictions; the Crown's perpetual
+  rights are limited to the United Kingdom.
+- **WEB** — the World English Bible is released into the public domain by
+  Michael Paul Johnson / eBible.org.
+
+If you redistribute the built database rather than the build script, you are
+redistributing public-domain text, not MIT-licensed code — keep the two licences
+separate.
+
 ## Notes
 
 - `BIBLE_DB` and `BIBLE_TRANSLATION` env vars override the defaults.
